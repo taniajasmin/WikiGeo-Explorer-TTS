@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Tourist API</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --bg:#f6f7fb; --card:#fff; --muted:#667; --pill:#eaf2ff; --accent:#2c7be5; }
+    body { margin:0; background:var(--bg); font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; color:#111; }
+    .wrap { max-width:980px; margin:28px auto 40px; padding:0 16px; }
+    h1 { margin:0 0 6px; font-size:22px; }
+    .sub { color:var(--muted); margin:0 0 14px; }
+    .card { background:var(--card); border:1px solid #eee; border-radius:14px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,.06); margin:14px 0; }
+    .row { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; }
+    .field { display:flex; flex-direction:column; }
+    label { font-size:12px; color:var(--muted); margin-bottom:6px; }
+    input, select { padding:10px 12px; border:1px solid #ddd; border-radius:10px; }
+    .actions { display:flex; gap:10px; align-items:center; margin-top:12px; }
+    button { padding:10px 14px; font-weight:600; border:0; border-radius:10px; background:var(--accent); color:#fff; cursor:pointer; }
+    .ghost { background:#dfe7ff; color:#2a2f45; }
+    .pill { display:inline-block; background:var(--pill); color:var(--accent); font-size:12px; padding:2px 8px; border-radius:999px; margin:4px 0; }
+    .muted { color:var(--muted); }
+    .head { display:flex; gap:14px; align-items:center; }
+    .head img { width:88px; height:88px; object-fit:cover; border-radius:10px; background:#f2f2f2; }
+    .toolbar { display:flex; gap:10px; align-items:center; margin:12px 0 6px; flex-wrap: wrap; }
+    audio { width:100%; margin-top:8px; }
+    .sep { height:1px; background:#eee; margin:12px 0; }
+    .bubble { background:#f9fafc; border-radius:12px; padding:12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Tourist API (Test)</h1>
+
+    <div class="card">
+      <div class="row">
+        <div class="field">
+          <label>Latitude</label>
+          <input id="lat" type="number" step="any" placeholder="48.8584" />
+        </div>
+        <div class="field">
+          <label>Longitude</label>
+          <input id="lng" type="number" step="any" placeholder="2.2945" />
+        </div>
+        <div class="field">
+          <label>Language</label>
+          <select id="lang"></select>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="btnLookup">Lookup</button>
+        <button id="btnClear" class="ghost" type="button">Clear</button>
+        <div id="status" class="muted"></div>
+      </div>
+    </div>
+
+    <div id="out" class="card" style="display:none">
+      <div class="head">
+        <img id="thumb" alt="" />
+        <div>
+          <h2 id="title">—</h2>
+          <div id="desc" class="pill">—</div>
+          <div class="muted"><a id="wiki" href="#" target="_blank">Wikipedia</a></div>
+        </div>
+      </div>
+
+      <div class="bubble" id="text"></div>
+
+      <div class="toolbar">
+        <button id="btnListen">🔊 Listen</button>
+        <button id="btnMore" class="ghost">Tell me more</button>
+        <button id="btnStop" class="ghost">⏹ Stop</button>
+      </div>
+
+      <audio id="player" controls style="display:none"></audio>
+
+      <div class="sep"></div>
+      <div id="ai" class="muted"></div>
+    </div>
+
+    <p class="muted" id="foot"></p>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const status = $("status");
+    const player = $("player");
+    let supported = {};
+    let defaultLang = "en";
+    let lastPayload = null;
+    let showingMore = false;
+    let currentText = "";
+
+    // ---------------- Config -----------------
+    async function loadConfig() {
+      const r = await fetch("/config");
+      const cfg = await r.json();
+      supported = cfg.supported_langs || {};
+      defaultLang = (cfg.default_lang || "en").toLowerCase();
+      $("foot").textContent = `Server TTS: gTTS • Gemini: ${cfg.gemini_enabled ? "on" : "off"}`;
+
+      const sel = $("lang");
+      sel.innerHTML = "";
+      Object.entries(supported).forEach(([code, name]) => {
+        const opt = document.createElement("option");
+        opt.value = code;
+        opt.textContent = `${name} (${code})`;
+        if (code === defaultLang) opt.selected = true;
+        sel.appendChild(opt);
+      });
+    }
+
+    // --------------- Helpers ----------------
+    function fillPlace(p) {
+      $("title").textContent = p.title || "—";
+      $("desc").textContent = p.description || "—";
+      $("wiki").href = p.page_url || "#";
+
+      const img = $("thumb");
+      if (p.thumbnail_url) { img.src = p.thumbnail_url; img.style.display=""; }
+      else { img.removeAttribute("src"); img.style.display="none"; }
+
+      // show short first
+      showingMore = false;
+      currentText = p.short_summary || p.extract || "";
+      $("text").textContent = currentText;
+      $("ai").innerHTML = p.ai_blurb ? `<strong>Gemini tip:</strong> ${p.ai_blurb}` : "";
+    }
+
+    async function doLookup() {
+      try {
+        status.textContent = "Searching…";
+        player.style.display = "none"; stopAllAudio();
+        $("out").style.display = "none";
+
+        const lat = parseFloat($("lat").value);
+        const lng = parseFloat($("lng").value);
+        const lang = $("lang").value || defaultLang;
+        if (Number.isNaN(lat) || Number.isNaN(lng)) { alert("Enter valid lat/lng"); status.textContent=""; return; }
+
+        const url = new URL("/api/lookup", window.location.origin);
+        url.searchParams.set("lat", lat);
+        url.searchParams.set("lng", lng);
+        url.searchParams.set("lang", lang);
+
+        const r = await fetch(url);
+        if (!r.ok) throw new Error("Lookup failed");
+        const data = await r.json();
+        lastPayload = data;
+
+        if (!data.best) { status.textContent = "No results."; return; }
+        fillPlace(data.best);
+
+        $("out").style.display = "block";
+        status.textContent = "Done.";
+      } catch (e) {
+        console.error(e);
+        status.textContent = "Error. See console.";
+      }
+    }
+
+    // --------------- TTS --------------------
+    async function playServerTTS(text) {
+      const lang = $("lang").value || defaultLang;
+      const r = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, lang }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        alert("TTS failed: " + (err.detail || r.status));
+        return;
+      }
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      player.src = url;
+      player.style.display = "block";
+      player.play().catch(() => {});
+    }
+
+    function playBrowserTTS(text) {
+      if (!('speechSynthesis' in window)) {
+        alert("Browser TTS not supported.");
+        return;
+      }
+      stopBrowserTTS();
+      const lang = ($("lang").value || defaultLang).toString();
+      const u = new SpeechSynthesisUtterance(text);
+      const vs = speechSynthesis.getVoices();
+      const m = vs.find(v => v.lang.toLowerCase().startsWith(lang.toLowerCase()));
+      if (m) u.voice = m;
+      u.lang = lang;
+      u.onend = () => { /* no-op */ };
+      u.onerror = () => { /* no-op */ };
+      // pause server audio if playing
+      if (!player.paused) player.pause();
+      speechSynthesis.speak(u);
+      window.__utter = u; // keep reference
+    }
+    function stopBrowserTTS() { if ('speechSynthesis' in window) speechSynthesis.cancel(); }
+
+    function stopAllAudio() {
+      stopBrowserTTS();
+      player.pause();
+      try { player.currentTime = 0; } catch (_) {}
+    }
+
+    // --------------- UI Wire ----------------
+    $("btnLookup").onclick  = doLookup;
+    $("btnClear").onclick   = () => { $("lat").value=""; $("lng").value=""; status.textContent=""; $("out").style.display="none"; stopAllAudio(); };
+
+    $("btnListen").onclick  = () => {
+      if (!lastPayload || !lastPayload.best) return;
+      // Play the current text via server TTS; Shift-click to use browser TTS
+      if (window.event && window.event.shiftKey) playBrowserTTS(currentText);
+      else playServerTTS(currentText);
+    };
+
+    $("btnMore").onclick = () => {
+      if (!lastPayload || !lastPayload.best) return;
+      const p = lastPayload.best;
+      showingMore = !showingMore;
+      currentText = showingMore ? (p.more_summary || p.short_summary || "") : (p.short_summary || "");
+      $("text").textContent = currentText;
+      $("btnMore").textContent = showingMore ? "Show less" : "Tell me more";
+      stopAllAudio();
+    };
+
+    $("btnStop").onclick   = stopAllAudio;
+
+    // Init
+    loadConfig().catch(e => { console.error(e); alert("Failed to load /config"); });
+    $("lat").value = "48.8584"; $("lng").value = "2.2945";
+  </script>
+</body>
+</html>
