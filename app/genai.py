@@ -70,6 +70,17 @@ async def translate_text(text: str, target_lang: str) -> Optional[str]:
     except Exception:
         return text
 
+def enforce_lines(text: str, lines: int) -> str:
+    if not text:
+        return ""
+    # Split on sentence boundaries.
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    parts = [p.strip() for p in parts if p.strip()]
+    kept = parts[: max(1, lines)]
+    # Join with newlines to make “lines”
+    out = "\n".join(kept)
+    return out 
+
 async def make_blurb(title: str, description: str, extract: str, url: str, lang: str) -> Optional[str]:
     if not enabled():
         return None

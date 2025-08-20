@@ -1,47 +1,65 @@
-from pathlib import Path
-from typing import Dict, Any, List, Optional
-
-from fastapi import FastAPI, Query, HTTPException, Body
-from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, Body, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from app.genai import enforce_lines
 
 from app.settings import settings, SUPPORTED_LANGS
 from app import wiki, genai, tts
 
-app = FastAPI(title="Tourist API")
 
-STATIC_DIR = Path(__file__).resolve().parent / "static"
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+class LookupRequest(BaseModel):
+    lat: float = Field(..., description="Latitude (WGS84)")
+    lng: float = Field(..., description="Longitude (WGS84)")
+    lang: Optional[str] = Field(None, description="Target language (ISO 639-1)")
+    radius: int = Field(8000, ge=100, le=30000, description="Search radius (m)")
+    limit: int = Field(8, ge=1, le=20, description="Max candidates")
 
-@app.get("/", response_class=HTMLResponse)
-def home():
-    index = STATIC_DIR / "index.html"
-    return FileResponse(str(index))
+class Place(BaseModel):
+    title: Optional[str]
+    normalized_title: Optional[str]
+    description: Optional[str]
+    extract: Optional[str]
+    coordinates: Dict[str, float]
+    page_url: Optional[str]
+    thumbnail_url: Optional[str]
+    original_image_url: Optional[str]
+    pageid: Optional[int]
+    lang: Optional[str]
+    short_summary: Optional[str]
+    more_summary: Optional[str]
+    ai_blurb: Optional[str] = None  # left for compatibility, always empty here
 
-@app.get("/config")
-def get_config():
-    return {
-        "default_lang": settings.DEFAULT_LANG,
-        "tts_provider": settings.TTS_PROVIDER,
-        "supported_langs": SUPPORTED_LANGS,
-        "gemini_enabled": bool(settings.GEMINI_API_KEY),
-    }
+class LookupResponse(BaseModel):
+    best: Optional[Place]
+    candidates: List[Place]
 
-@app.get("/api/lookup")
-async def lookup(
-    lat: float = Query(..., description="Latitude (WGS84)"),
-    lng: float = Query(..., description="Longitude (WGS84)"),
-    radius: int = Query(8000, ge=100, le=30000),
-    limit: int = Query(8, ge=1, le=20),
-    lang: Optional[str] = Query(None, description="Target language (ISO 639-1)"),
-):
-    language = (lang or settings.DEFAULT_LANG).lower()
+
+class TTSRequest(BaseModel):
+    text: str
+    lang: Optional[str] = None
+
+
+app = FastAPI(title="Tourist API (backend only)")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.post("/api/lookup", response_model=LookupResponse)
+async def lookup(req: LookupRequest = Body(...)) -> LookupResponse:
+    language = (req.lang or settings.DEFAULT_LANG).lower()
     if language not in SUPPORTED_LANGS:
         language = "en"
 
-    raw = await wiki.geosearch_en(lat, lng, radius, limit)
+    raw = await wiki.geosearch_en(req.lat, req.lng, req.radius, req.limit)
     if not raw:
-        return {"best": None, "candidates": []}
+        return LookupResponse(best=None, candidates=[])
 
     enriched: List[Dict[str, Any]] = []
     for c in raw:
@@ -60,7 +78,6 @@ async def lookup(
 
         place = wiki.normalize(c, s, language)
 
-        # Base texts
         base_short = " ".join(filter(None, [
             place.get("title"), place.get("description"), place.get("extract")
         ])).strip()
@@ -71,7 +88,6 @@ async def lookup(
         if not base_more:
             base_more = await wiki.full_extract(c["title"], "en")
 
-        # Summaries: short=~5 lines, long=~15 lines (Gemini if available; safe fallback otherwise)
         short_text = await genai.summarize_to_length(
             base_short or (base_more or ""),
             language,
@@ -85,38 +101,39 @@ async def lookup(
             max_chars=3000,
         )
 
-        # Translate title/description if we fell back to EN
         if used_en_fallback and language != "en":
             place["title"] = await genai.translate_text(place["title"], language) or place["title"]
             if place.get("description"):
                 place["description"] = await genai.translate_text(place["description"], language) or place["description"]
 
-        place["short_summary"] = short_text or (place.get("extract") or "")
-        place["more_summary"]  = more_text or place["short_summary"]
+        # place["short_summary"] = short_text or (place.get("extract") or "")
+        # place["more_summary"] = more_text or place["short_summary"]
+        place["short_summary"] = enforce_lines(short_text or (place.get("extract") or ""), 5)
+        place["more_summary"]  = enforce_lines(more_text or place["short_summary"], 15)
 
         enriched.append(place)
 
     if not enriched:
-        return {"best": None, "candidates": []}
+        return LookupResponse(best=None, candidates=[])
 
     with_img = [p for p in enriched if p.get("thumbnail_url")]
     best = (with_img or enriched)[0]
 
-    best["ai_blurb"] = await genai.make_blurb(
-        best["title"], best.get("description") or "",
-        best.get("short_summary") or "",
-        best.get("page_url") or "", language
-    )
+    best["ai_blurb"] = None
 
-    return {"best": best, "candidates": enriched}
+    best_model = Place(**best)
+    cand_models = [Place(**p) for p in enriched]
+
+    return LookupResponse(best=best_model, candidates=cand_models)
+
 
 @app.post("/api/tts")
-async def tts_gtts(text: str = Body(..., embed=True), lang: Optional[str] = Body(None)):
-    language = (lang or settings.DEFAULT_LANG).lower()
+async def tts_api(req: TTSRequest = Body(...)):
+    language = (req.lang or settings.DEFAULT_LANG).lower()
     if language not in SUPPORTED_LANGS:
         language = "en"
     try:
-        audio, mime = await tts.synthesize(text.strip(), language, provider="gtts")
+        audio, mime = await tts.synthesize(req.text.strip(), language, provider="gtts")
     except RuntimeError as err:
         raise HTTPException(status_code=400, detail=str(err))
     if not audio:

@@ -4,8 +4,7 @@ from urllib.parse import quote
 
 import httpx
 
-# -------------------- Endpoints --------------------
-# Stable geosearch uses EN Wikipedia so the place set doesn't change with language
+# Stable geosearch useing EN Wikipedia only
 EN_GEOSEARCH_API = "https://en.wikipedia.org/w/api.php"
 
 # Get Wikidata QID (wikibase_item) for an EN pageid
@@ -14,10 +13,8 @@ EN_PAGEPROPS_API = (
     "?action=query&prop=pageprops&pageids={pageid}&ppprop=wikibase_item&format=json"
 )
 
-# Wikidata entity endpoint -> sitelinks
 WIKIDATA_ENTITY = "https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
 
-# put with the other URLs
 FULL_EXTRACT_URL = (
     "https://{lang}.wikipedia.org/w/api.php"
     "?action=query&prop=extracts&explaintext=1&redirects=1&titles={title}&format=json"
@@ -27,8 +24,6 @@ FULL_EXTRACT_URL = (
 SUMMARY_URL = "https://{lang}.wikipedia.org/api/rest_v1/page/summary/{title}"
 PLAIN_URL   = "https://{lang}.wikipedia.org/api/rest_v1/page/plain/{title}"
 
-
-# -------------------- HTTP helpers -----------------
 async def _get_json(url: str, params: Optional[Dict[str, Any]] = None,
                     headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     async with httpx.AsyncClient() as client:
@@ -64,8 +59,6 @@ async def full_extract(title: str, lang: str) -> Optional[str]:
         return txt if txt else None
     return None
 
-
-# -------------------- Core lookups ------------------
 async def geosearch_en(lat: float, lng: float, radius: int = 8000, limit: int = 8) -> List[Dict[str, Any]]:
     """
     Search EN Wikipedia for pages near given coordinates; returns the 'geosearch' list.
@@ -119,7 +112,6 @@ async def summary_in_lang(title: str, lang: str) -> Optional[Dict[str, Any]]:
     try:
         url = SUMMARY_URL.format(lang=lang, title=quote(title, safe=""))
         data = await _get_json(url, headers={"accept-language": lang})
-        # Known failure pattern: summary service may return {"type":"https://.../problem+json"}
         if not isinstance(data, dict) or data.get("type", "").endswith("problem+json"):
             return None
         return data
@@ -140,7 +132,6 @@ async def plain_text(title: str, lang: str) -> Optional[str]:
         return None
 
 
-# -------------------- Normalizer --------------------
 def normalize(candidate: Dict[str, Any], s: Dict[str, Any], lang: str) -> Dict[str, Any]:
     """
     Shape a single place entry for the API response.
