@@ -1,4 +1,4 @@
-# 🌍 Tourist Info API
+# WikiGeo-Explorer-TTS
 
 A FastAPI backend that lets you query Wikipedia for tourist places by latitude/longitude and get:
 - 📍 Stable tourist places near coordinates (via **English Wikipedia only** to avoid changing results when switching languages).
